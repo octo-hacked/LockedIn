@@ -14,7 +14,7 @@ const httpServer = createServer(app);
 
 
 const allowedOrigins = [
-  "http://localhost:3000",
+  process.env.FRONTEND_URL,
   "https://f25eac5ccded46f5baaa0ad55feac9bc-br-516829e5f53743bea66f7aaae.fly.dev",
   "https://builder.io/app/projects/f25eac5ccded46f5baaa0ad55feac9bc" // 👈 add the real origin here
 ];
