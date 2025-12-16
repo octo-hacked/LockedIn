@@ -1,0 +1,6 @@
+{
+  "editor.fontLigatures": true,
+  "editor.fontWeight": "500",    
+  "editor.fontSize": 15,              // makes default code a bit thicker
+  "workbench.colorTheme": "Dark Chai"
+}
