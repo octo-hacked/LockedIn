@@ -2,7 +2,7 @@ import { useRef, useState } from "react";
 import Sidebar from "@/components/Sidebar";
 import BottomBar from "@/components/BottomBar";
 import ReelsFeed from "@/components/ReelsFeed";
-import InboxSidebar from "@/components/InboxSidebar";
+import InboxSidebar, { SIDEBAR_DEFAULT_WIDTH } from "@/components/InboxSidebar";
 import CommentsSheet from "@/components/CommentsSheet";
 import type { FeedPost, Category } from "@/components/MainFeed";
 
@@ -14,6 +14,8 @@ const Capsules = () => {
   const allCategories: Category[] = ["memes", "news", "other"];
   const [selectedCategories, setSelectedCategories] = useState<Category[]>(allCategories);
   const [lowDopamineOnly, setLowDopamineOnly] = useState(false);
+  const [sidebarWidth, setSidebarWidth] = useState(SIDEBAR_DEFAULT_WIDTH);
+  const [isSidebarResizing, setIsSidebarResizing] = useState(false);
 
   const inboxRef = useRef<HTMLDivElement | null>(null);
   const [fly, setFly] = useState<
@@ -138,8 +140,8 @@ const Capsules = () => {
         />
       </div>
       <ReelsFeed onOpenComments={handleOpenComments} onOpenShare={handleOpenShare} selectedCategories={selectedCategories} lowDopamineOnly={lowDopamineOnly} onBack={() => (window.location.href = "/")} />
-      <div ref={inboxRef} className="relative hidden xl:block">
-        <InboxSidebar postPreview={postPreview} onBackFromPost={() => setPostPreview(null)} postToShare={postToShare} onBackFromShare={() => setPostToShare(null)} />
+      <div ref={inboxRef} className="relative hidden xl:block flex-shrink-0" style={{ width: sidebarWidth, transition: isSidebarResizing ? "none" : "width 250ms ease-in-out" }}>
+        <InboxSidebar postPreview={postPreview} onBackFromPost={() => setPostPreview(null)} postToShare={postToShare} onBackFromShare={() => setPostToShare(null)} width={sidebarWidth} onWidthChange={setSidebarWidth} onResizeStart={() => setIsSidebarResizing(true)} onResizeEnd={() => setIsSidebarResizing(false)} />
       </div>
       <CommentsSheet open={!!mobileComments} post={mobileComments} onClose={() => setMobileComments(null)} />
       <BottomBar

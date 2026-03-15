@@ -1,9 +1,19 @@
-import { Heart, MessageCircle, Share2, BadgeCheck, MoreHorizontal, ArrowLeft } from "lucide-react";
+import {
+  Heart, MessageCircle, Share2, BadgeCheck, MoreHorizontal,
+  ArrowLeft, Play, Volume2, VolumeX, Loader2, RefreshCw,
+} from "lucide-react";
 import { useEffect, useRef, useState, useCallback } from "react";
 import type { Category, FeedPost } from "@/components/MainFeed";
+import { useAuth } from "@/context/AuthContext";
+import { API_BASE } from "@/lib/config";
+import { formatDateRelative } from "@/lib/utils";
+
+// ─── Types ────────────────────────────────────────────────────────────────────
 
 export type Reel = {
   id: number;
+  remoteId?: string;       // backend _id
+  uploaderId?: string;     // uploadedBy._id
   username: string;
   description: string;
   likes: number;
@@ -18,9 +28,6 @@ export type Reel = {
   liked?: boolean;
 };
 
-const avatarFor = (seed: string) => `https://i.pravatar.cc/100?u=${encodeURIComponent(seed)}`;
-const posterFor = (seed: string | number) => `https://picsum.photos/seed/${encodeURIComponent(String(seed))}/600/900`;
-
 type ReelsFeedProps = {
   onOpenComments?: (post: FeedPost, fromRect: DOMRect) => void;
   onOpenShare?: (post: FeedPost, fromRect: DOMRect) => void;
@@ -29,253 +36,594 @@ type ReelsFeedProps = {
   onBack?: () => void;
 };
 
-const SAMPLE_REELS: Reel[] = [
-  {
-    id: 101,
-    username: "reels_sarah",
-    description: "Mindful tech tip: set a timer before scrolling.",
-    likes: 230,
-    comments: 12,
-    time: "2h",
-    video: "https://storage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4",
-    poster: posterFor("reel-sarah"),
-    avatar: avatarFor("reels_sarah"),
-    category: "news",
-    lowDopamine: true,
-    isVerified: true,
-  },
-  {
-    id: 102,
-    username: "alex_reels",
-    description: "Weekend vibes and focus tips.",
-    likes: 450,
-    comments: 28,
-    time: "4h",
-    video: "https://storage.googleapis.com/gtv-videos-bucket/sample/ElephantsDream.mp4",
-    poster: posterFor("reel-alex"),
-    avatar: avatarFor("alex_reels"),
-    category: "other",
-    lowDopamine: false,
-    isVerified: false,
-  },
-  {
-    id: 103,
-    username: "jordan_reels",
-    description: "Minimalist workspace tour.",
-    likes: 180,
-    comments: 9,
-    time: "6h",
-    video: "https://storage.googleapis.com/gtv-videos-bucket/sample/Sintel.mp4",
-    poster: posterFor("reel-jordan"),
-    avatar: avatarFor("jordan_reels"),
-    category: "memes",
-    lowDopamine: false,
-    isVerified: false,
-  },
-  {
-    id: 104,
-    username: "emma_reels",
-    description: "Intentional design = better habits.",
-    likes: 310,
-    comments: 18,
-    time: "8h",
-    video: "https://storage.googleapis.com/gtv-videos-bucket/sample/TearsOfSteel.mp4",
-    poster: posterFor("reel-emma"),
-    avatar: avatarFor("emma_reels"),
-    category: "news",
-    lowDopamine: true,
-    isVerified: true,
-  },
-];
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
-const ReelsFeed = ({ onOpenComments, onOpenShare, selectedCategories, lowDopamineOnly, onBack }: ReelsFeedProps) => {
-  const [reels, setReels] = useState<Reel[]>(SAMPLE_REELS);
-  const [mutedByDefault] = useState(true);
+const avatarFor = (seed: string) =>
+  `https://i.pravatar.cc/100?u=${encodeURIComponent(seed)}`;
+const posterFor = (seed: string | number) =>
+  `https://picsum.photos/seed/${encodeURIComponent(String(seed))}/600/900`;
 
-  const activeCategories: Category[] = selectedCategories && selectedCategories.length > 0 ? selectedCategories : ["memes", "news", "other"];
-  const onlyLow = Boolean(lowDopamineOnly);
-  const visibleReels = reels.filter((r) => activeCategories.includes(r.category) && (!onlyLow || r.lowDopamine));
+/** Every 5th reel (0-indexed: 4, 9, 14 …) is a mindful-break reel */
+const isMindfulBreak = (idx: number) => (idx + 1) % 5 === 0;
 
-  const containerRef = useRef<HTMLDivElement | null>(null);
+
+// ─── Component ────────────────────────────────────────────────────────────────
+
+const ReelsFeed = ({
+  onOpenComments,
+  onOpenShare,
+  selectedCategories,
+  lowDopamineOnly,
+  onBack,
+}: ReelsFeedProps) => {
+  const { accessToken } = useAuth();
+
+  // ── API fetch state ────────────────────────────────────────────────────
+  const [reels,      setReels]      = useState<Reel[]>([]);
+  const [page,       setPage]       = useState(1);
+  const [hasMore,    setHasMore]    = useState(true);
+  const [loadingAPI, setLoadingAPI] = useState(false);
+  const [apiError,   setApiError]   = useState<string | null>(null);
+
+  // ── Refs ────────────────────────────────────────────────────────────────
+  const containerRef = useRef<HTMLDivElement>(null);
   const videoRefs = useRef<Record<number, HTMLVideoElement | null>>({});
-  const [visibleIndex, setVisibleIndex] = useState(0);
-  const observerRef = useRef<IntersectionObserver | null>(null);
 
-  // Prefetch next N videos
-  const prefetch = useCallback((index: number) => {
-    for (let i = index + 1; i <= index + 2; i++) {
-      const reel = visibleReels[i];
-      if (!reel) continue;
-      const link = document.createElement("link");
-      link.rel = "preload";
-      link.as = "video";
-      link.href = reel.video;
-      document.head.appendChild(link);
+  // ── State ───────────────────────────────────────────────────────────────
+  const [activeIndex, setActiveIndex] = useState(0);
+
+  /** muted: true by default (browsers require mute to autoplay) */
+  const [mutedMap, setMutedMap] = useState<Record<number, boolean>>({});
+
+  /** Whether each video is currently playing (driven by video events) */
+  const [playingMap, setPlayingMap] = useState<Record<number, boolean>>({});
+
+  /** Per-reel like state */
+  const [likedMap, setLikedMap] = useState<Record<number, { liked: boolean; count: number }>>({});
+
+  /** Set of indices where the mindful-break overlay has been dismissed */
+  const [mindfulDismissed, setMindfulDismissed] = useState<Set<number>>(new Set());
+
+  const avatarFor = (seed: string) =>
+    `https://i.pravatar.cc/100?u=${encodeURIComponent(seed)}`;
+  const posterFor = (seed: string | number) =>
+    `https://picsum.photos/seed/${encodeURIComponent(String(seed))}/600/900`;
+
+  /** Map a raw API reel document into our Reel shape */
+  const mapReel = useCallback((p: any, idx: number): Reel => {
+    const username   = p.uploadedBy?.username || p.username || "unknown";
+    const rawCat     = String(p.category || "other").toLowerCase();
+    const validCats: Category[] = ["memes", "news", "other"];
+    const category   = (validCats.includes(rawCat as Category) ? rawCat : "other") as Category;
+    const mediaUrl   = typeof p.media === "string" ? p.media
+                     : Array.isArray(p.media)       ? p.media[0]?.url
+                     : undefined;
+
+    return {
+      id:         idx,                              // local numeric key for videoRefs
+      remoteId:   p._id ?? (typeof p.id === "string" ? p.id : undefined),
+      uploaderId: p.uploadedBy?._id,
+      username,
+      description: p.description || p.title || "",
+      likes:       p.likes ?? 0,
+      comments:    p.comments ?? 0,
+      time:        p.timeAgo ?? (p.createdAt ? formatDateRelative(p.createdAt) : ""),
+      video:       mediaUrl || "",
+      poster:      p.uploadedBy?.avatar || posterFor(p._id || idx),
+      avatar:      p.uploadedBy?.avatar || avatarFor(username),
+      category,
+      lowDopamine: Boolean(p.isLowDopamine),
+      isVerified:  Boolean(p.uploadedBy?.isVerified),
+      liked:       Boolean(p.isLikedByUser ?? false),
+    };
+  }, []);
+
+  /** Fetch one page of reels from the backend */
+  const fetchReels = useCallback(async (pageNum: number, replace = false) => {
+    setLoadingAPI(true);
+    setApiError(null);
+    try {
+      const params = new URLSearchParams({
+        page:  String(pageNum),
+        limit: "10",
+        ...(lowDopamineOnly ? { lowDopamineOnly: "true" } : {}),
+      });
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      if (accessToken) headers["Authorization"] = `Bearer ${accessToken}`;
+
+      const res  = await fetch(`${API_BASE}/posts/reels?${params}`, { headers, credentials: "include" });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+
+      const rawItems: any[] = data?.reels || data?.posts || data?.items || data?.data?.reels || [];
+      const totalCount: number = data?.totalReels ?? data?.total ?? rawItems.length;
+
+      if (rawItems.length === 0) {
+        setHasMore(false);
+        if (replace) setReels([]);
+        return;
+      }
+
+      setReels(prev => {
+        const base   = replace ? [] : prev;
+        const offset = base.length;
+        const mapped = rawItems.map((p, i) => mapReel(p, offset + i));
+        return [...base, ...mapped];
+      });
+
+      setHasMore((pageNum * 10) < totalCount);
+    } catch (err: any) {
+      console.error("Failed to fetch reels:", err);
+      setApiError(err?.message || "Failed to load reels");
+      setHasMore(false);
+    } finally {
+      setLoadingAPI(false);
     }
-  }, [visibleReels]);
+  }, [accessToken, lowDopamineOnly, mapReel]);
 
+  // Initial fetch + refetch when filter changes
+  useEffect(() => {
+    setPage(1);
+    setHasMore(true);
+    fetchReels(1, true);
+  }, [lowDopamineOnly]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Load next page when user approaches the last reel
+  useEffect(() => {
+    if (!hasMore || loadingAPI) return;
+    if (reels.length > 0 && activeIndex >= reels.length - 3) {
+      const nextPage = page + 1;
+      setPage(nextPage);
+      fetchReels(nextPage, false);
+    }
+  }, [activeIndex, reels.length, hasMore, loadingAPI]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Client-side category filter applied on top of the fetched list
+  const activeCategories: Category[] =
+    selectedCategories && selectedCategories.length > 0
+      ? selectedCategories
+      : ["memes", "news", "other"];
+  const onlyLow = Boolean(lowDopamineOnly);
+  const visibleReels = reels.filter(
+    (r) => activeCategories.includes(r.category) && (!onlyLow || r.lowDopamine)
+  );
+
+
+
+  // ── Scroll → detect active reel ─────────────────────────────────────────
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
 
-    // Ensure scroll-snap
-    el.style.scrollSnapType = "y mandatory";
-    el.style.overflowY = "auto";
-
-    // Intersection observer for autoplay
-    observerRef.current = new IntersectionObserver((entries) => {
-      entries.forEach((entry) => {
-        const idx = Number(entry.target.getAttribute("data-index"));
-        const vidId = entry.target.getAttribute("data-vid-id");
-        const video = vidId ? document.getElementById(vidId) as HTMLVideoElement | null : null;
-        if (entry.isIntersecting && entry.intersectionRatio > 0.6) {
-          setVisibleIndex(idx);
-          // play this video
-          try { video?.play(); } catch {}
-          // pause others
-          Object.keys(videoRefs.current).forEach((k) => {
-            const n = Number(k);
-            if (n !== idx) videoRefs.current[n]?.pause();
-          });
-          prefetch(idx);
-        } else {
-          // when out of view pause
-          try { if (video && !entry.isIntersecting) video.pause(); } catch {}
-        }
+    let rafId = 0;
+    const onScroll = () => {
+      cancelAnimationFrame(rafId);
+      rafId = requestAnimationFrame(() => {
+        const idx = Math.round(el.scrollTop / el.clientHeight);
+        setActiveIndex((prev) => (prev === idx ? prev : idx));
       });
-    }, { threshold: [0.6] });
-
-    const items = Array.from(el.querySelectorAll('[data-reel-item]')) as HTMLElement[];
-    items.forEach((it) => observerRef.current?.observe(it));
-
-    return () => {
-      observerRef.current?.disconnect();
-      observerRef.current = null;
     };
-  }, [visibleReels, prefetch]);
 
+    el.addEventListener("scroll", onScroll, { passive: true });
+    return () => {
+      el.removeEventListener("scroll", onScroll);
+      cancelAnimationFrame(rafId);
+    };
+  }, []);
+
+  // ── Play / pause logic when active index changes or reels first load ───────
   useEffect(() => {
-    // when visibleIndex changes ensure muted state default
-    const vid = videoRefs.current[visibleIndex];
-    if (vid) {
-      vid.muted = mutedByDefault;
-      vid.loop = true;
-      vid.playsInline = true;
-    }
-  }, [visibleIndex, mutedByDefault]);
+    visibleReels.forEach((_, idx) => {
+      const video = videoRefs.current[idx];
+      if (!video) return;
 
-  const toggleMute = (idx: number) => {
-    const v = videoRefs.current[idx];
-    if (!v) return;
-    v.muted = !v.muted;
-  };
+      if (idx === activeIndex) {
+        // Always ensure the active video is muted (required for autoplay)
+        video.muted = mutedMap[idx] !== false;
+
+        if (isMindfulBreak(idx) && !mindfulDismissed.has(idx)) {
+          video.pause();
+        } else {
+          // If the video has enough data, play immediately;
+          // otherwise wait for canplay which will trigger playOnReady below.
+          if (video.readyState >= 3) {
+            video.play().catch(() => {});
+          }
+          // attach a one-shot canplay listener in case data isn't ready yet
+          const onCanPlay = () => {
+            video.removeEventListener("canplay", onCanPlay);
+            // only play if this is still the active slide
+            if (videoRefs.current[activeIndex] === video) {
+              video.play().catch(() => {});
+            }
+          };
+          video.addEventListener("canplay", onCanPlay);
+          // clean up listener if it never fires (e.g. index changes)
+          return () => video.removeEventListener("canplay", onCanPlay);
+        }
+      } else {
+        video.pause();
+        if (Math.abs(idx - activeIndex) > 2 && video.src) {
+          video.load();
+        }
+      }
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeIndex, mindfulDismissed, visibleReels.length]);
+
+  // ── Sync mute imperatively when mutedMap changes ──────────────────────────
+  useEffect(() => {
+    Object.entries(mutedMap).forEach(([idxStr, muted]) => {
+      const video = videoRefs.current[Number(idxStr)];
+      if (video) video.muted = muted;
+    });
+  }, [mutedMap]);
+
+  // ── Actions ──────────────────────────────────────────────────────────────
 
   const togglePlay = (idx: number) => {
-    const v = videoRefs.current[idx];
-    if (!v) return;
-    if (v.paused) v.play(); else v.pause();
+    const video = videoRefs.current[idx];
+    if (!video) return;
+    if (video.paused) {
+      video.play().catch(() => {});
+    } else {
+      video.pause();
+    }
   };
 
-  const handleClick = (e: React.MouseEvent, idx: number) => {
-    // clicking anywhere toggles play/pause; clicking right action bar shouldn't toggle
-    const target = e.target as HTMLElement;
-    if (target.closest('[data-action]')) return;
-    togglePlay(idx);
+  const toggleMute = (idx: number) => {
+    setMutedMap((prev) => ({ ...prev, [idx]: !(prev[idx] !== false) }));
   };
 
-  const handleComment = (e: React.MouseEvent, reel: Reel) => {
-    const vidEl = videoRefs.current[visibleReels.indexOf(reel)];
-    const rect = vidEl ? vidEl.getBoundingClientRect() : new DOMRect(0,0,0,0);
-    if (onOpenComments) onOpenComments({ id: reel.id, username: reel.username, content: reel.description, likes: reel.likes, comments: reel.comments, time: reel.time, image: reel.poster, avatar: reel.avatar, category: reel.category, lowDopamine: reel.lowDopamine, isVerified: reel.isVerified, liked: reel.liked }, rect);
+  const toggleLike = (reel: Reel) => {
+    setLikedMap((prev) => {
+      const cur = prev[reel.id] ?? { liked: reel.liked ?? false, count: reel.likes };
+      return {
+        ...prev,
+        [reel.id]: {
+          liked: !cur.liked,
+          count: cur.liked ? cur.count - 1 : cur.count + 1,
+        },
+      };
+    });
   };
 
-  // responsive max width
-  const containerClass = "w-full h-screen flex flex-col items-center justify-start bg-black text-white";
+  const dismissMindful = (idx: number) => {
+    setMindfulDismissed((prev) => new Set([...prev, idx]));
+    const video = videoRefs.current[idx];
+    if (video) video.play().catch(() => {});
+  };
+
+  const handleComment = (reel: Reel, idx: number) => {
+    const video = videoRefs.current[idx];
+    const rect = video?.getBoundingClientRect() ?? new DOMRect(0, 0, 0, 0);
+    onOpenComments?.(
+      {
+        id: reel.id,
+        username: reel.username,
+        content: reel.description,
+        likes: reel.likes,
+        comments: reel.comments,
+        time: reel.time,
+        image: reel.poster,
+        avatar: reel.avatar,
+        category: reel.category,
+        lowDopamine: reel.lowDopamine,
+        isVerified: reel.isVerified,
+        liked: reel.liked,
+      },
+      rect
+    );
+  };
+
+  const handleShare = (reel: Reel, idx: number) => {
+    const video = videoRefs.current[idx];
+    const rect = video?.getBoundingClientRect() ?? new DOMRect(0, 0, 0, 0);
+    onOpenShare?.(
+      {
+        id: reel.id,
+        username: reel.username,
+        content: reel.description,
+        likes: reel.likes,
+        comments: reel.comments,
+        time: reel.time,
+        image: reel.poster,
+        avatar: reel.avatar,
+        category: reel.category,
+        lowDopamine: reel.lowDopamine,
+        isVerified: reel.isVerified,
+        liked: reel.liked,
+      },
+      rect
+    );
+  };
+
+  // ── Render ───────────────────────────────────────────────────────────────
 
   return (
-    <div className={`flex-1 relative flex items-center justify-center`}>
-      <div className="absolute top-4 left-4 z-20">
-        <button onClick={onBack} className="flex items-center gap-2 px-3 py-1.5 rounded bg-black/50 text-white text-sm hover:bg-black/60">
-          <ArrowLeft className="w-4 h-4" /> Back
-        </button>
-      </div>
+    /**
+     * Outer wrapper: full-width column. On mobile subtract the BottomBar height
+     * (h-14 = 56px) so the feed never slides under it.
+     */
+    <div className="flex-1 relative bg-black overflow-hidden">
 
-      <div ref={containerRef} className={`${containerClass} snap-y snap-mandatory`} style={{ maxWidth: 600, margin: "0 auto" }}>
+      {/* Back button — always on top */}
+      <button
+        onClick={onBack}
+        className="absolute top-4 left-4 z-40 flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-black/50 backdrop-blur-sm text-white text-sm hover:bg-black/70 transition-colors"
+      >
+        <ArrowLeft className="w-4 h-4" />
+        Back
+      </button>
+
+      {/* Responsive height:
+            Mobile  → viewport minus BottomBar (h-14 = 56px)
+            Desktop → full viewport (BottomBar is md:hidden so not rendered)
+      */}
+      <style>{`
+        .reel-scroll-container, .reel-slide {
+          height: calc(100vh - 56px);
+        }
+        @media (min-width: 768px) {
+          .reel-scroll-container, .reel-slide {
+            height: 100vh;
+          }
+        }
+      `}</style>
+      <div
+        ref={containerRef}
+        className="reel-scroll-container w-full overflow-y-scroll"
+        style={{
+          scrollSnapType: "y mandatory",
+          scrollBehavior: "auto",
+          WebkitOverflowScrolling: "touch",
+        }}
+      >
+
         {visibleReels.map((reel, idx) => {
-          const isVisible = idx === visibleIndex;
+          const isMuted = mutedMap[idx] !== false; // default muted
+          const isPlaying = playingMap[idx] ?? false;
+          const likeState = likedMap[reel.id] ?? {
+            liked: reel.liked ?? false,
+            count: reel.likes,
+          };
+          const isMindful = isMindfulBreak(idx);
+          const showMindfulOverlay = isMindful && !mindfulDismissed.has(idx);
+          const isActive = idx === activeIndex;
+
+          // Load src for current reel and its immediate neighbours
+          const shouldLoadSrc = Math.abs(idx - activeIndex) <= 1;
+
           return (
+            /*
+             * Outer slide: full snap height, black background fills any
+             * letterbox space around the 9:16 video box.
+             * flex + items-center + justify-center centres the inner box.
+             */
             <div
               key={reel.id}
-              data-reel-item
-              data-index={idx}
-              data-vid-id={`reel-video-${reel.id}`}
-              className="snap-start w-full flex items-center justify-center"
-              style={{ height: '100vh', scrollSnapAlign: 'start', padding: '12px' }}
-              onClick={(e) => handleClick(e, idx)}
+              className="reel-slide w-full flex-shrink-0 bg-black flex items-center justify-center select-none"
+              style={{ scrollSnapAlign: "start", scrollSnapStop: "always" }}
+              onClick={(e) => {
+                if ((e.target as HTMLElement).closest("[data-action]")) return;
+                if (showMindfulOverlay) return;
+                togglePlay(idx);
+              }}
             >
-              <div className="relative w-full max-w-[600px] h-[90vh] rounded-xl overflow-hidden bg-black shadow-lg">
-                <video
-                  id={`reel-video-${reel.id}`}
-                  ref={(el) => (videoRefs.current[idx] = el)}
-                  poster={reel.poster}
-                  // don't set src until near viewport to allow lazy
-                  src={isVisible ? reel.video : undefined}
-                  className="w-full h-full object-cover"
-                  muted
-                  loop
-                  playsInline
-                  preload={isVisible ? 'auto' : 'metadata'}
-                />
+              {/*
+               * Inner 9:16 box.
+               * `width: auto; height: auto` lets the browser find the
+               * largest 9:16 rectangle that fits inside both max-width (100%)
+               * and max-height (100%) — i.e. "contain" behaviour.
+               * On a portrait phone this fills the full width; on a landscape
+               * desktop it fills the full height with black bars on each side.
+               */}
+              <div
+                className="relative overflow-hidden"
+                style={{
+                  aspectRatio: "9 / 16",
+                  maxHeight: "100%",
+                  maxWidth: "100%",
+                  width: "auto",
+                  height: "auto",
+                }}
+              >
+              {/* ── Video ─────────────────────────────────────────────── */}
+              <video
+                ref={(el) => (videoRefs.current[idx] = el)}
+                src={shouldLoadSrc ? reel.video : undefined}
+                poster={reel.poster}
+                className="w-full h-full object-cover"
+                muted={isMuted}
+                autoPlay={isActive && !showMindfulOverlay}
+                loop
+                playsInline
+                preload={isActive ? "auto" : "metadata"}
+                onPlay={() =>
+                  setPlayingMap((prev) => ({ ...prev, [idx]: true }))
+                }
+                onPause={() =>
+                  setPlayingMap((prev) => ({ ...prev, [idx]: false }))
+                }
+                onCanPlay={() => {
+                  // When video is ready, play it if it is the active non-break reel
+                  if (isActive && !showMindfulOverlay) {
+                    videoRefs.current[idx]?.play().catch(() => {});
+                  }
+                }}
+              />
 
-                {/* Right action bar */}
-                <div className="absolute right-3 bottom-24 flex flex-col items-center gap-4 text-white z-10">
-                  <button data-action aria-label="Like" onClick={() => toggleLike(reel.id)} className={`flex flex-col items-center gap-1`}>
-                    <Heart className={`w-8 h-8 ${reel.liked ? 'text-red-500' : 'text-white'}`} />
-                    <span className="text-xs">{reel.likes}</span>
-                  </button>
-                  <button data-action aria-label="Comment" onClick={(e) => handleComment(e, reel)} className="flex flex-col items-center gap-1">
-                    <MessageCircle className="w-8 h-8 text-white" />
-                    <span className="text-xs">{reel.comments}</span>
-                  </button>
-                  <button data-action aria-label="Share" onClick={(e) => { const rect = (videoRefs.current[idx])?.getBoundingClientRect() ?? new DOMRect(0,0,0,0); if (onOpenShare) onOpenShare({ id: reel.id, username: reel.username, content: reel.description, likes: reel.likes, comments: reel.comments, time: reel.time, image: reel.poster, avatar: reel.avatar, category: reel.category, lowDopamine: reel.lowDopamine, isVerified: reel.isVerified, liked: reel.liked }, rect); }} className="flex flex-col items-center gap-1">
-                    <Share2 className="w-8 h-8 text-white" />
-                    <span className="text-xs">Share</span>
-                  </button>
-                  <button data-action aria-label="More" className="flex flex-col items-center gap-1">
-                    <MoreHorizontal className="w-6 h-6 text-white" />
-                  </button>
-                </div>
-
-                {/* Bottom overlay */}
-                <div className="absolute bottom-0 left-0 right-0 p-4 pb-6 bg-gradient-to-t from-black/90 via-black/50 to-transparent z-10">
-                  <div className="flex items-center gap-3">
-                    <img src={reel.avatar} alt={reel.username} className="w-10 h-10 rounded-full object-cover" />
-                    <div className="flex-1 min-w-0">
-                      <div className="flex items-center gap-2">
-                        <span className="font-semibold truncate">{reel.username}</span>
-                        {reel.isVerified && <BadgeCheck className="w-4 h-4 text-accent" />}
-                        <button className="ml-2 text-sm px-2 py-1 rounded bg-white text-black">Follow</button>
-                      </div>
-                      <div className="text-sm text-muted-foreground truncate max-w-full">{reel.description}</div>
-                    </div>
-                    <div className="flex flex-col items-center ml-3">
-                      <div className="w-10 h-10 rounded-full bg-black/40 flex items-center justify-center text-xs">♫</div>
-                    </div>
+              {/* ── Paused indicator (shown when paused, not mindful break) ── */}
+              {!isPlaying && !showMindfulOverlay && isActive && (
+                <div className="absolute inset-0 flex items-center justify-center pointer-events-none z-10">
+                  <div className="w-16 h-16 rounded-full bg-black/50 flex items-center justify-center backdrop-blur-sm">
+                    <Play className="w-7 h-7 text-white ml-1" fill="white" />
                   </div>
                 </div>
+              )}
 
-                {/* Center overlay controls (play/pause, volume) */}
-                <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-                  <div className="opacity-0 hover:opacity-100 pointer-events-auto transition-opacity">
-                    <button onClick={() => togglePlay(idx)} className="bg-black/50 p-3 rounded-full text-white pointer-events-auto">Play</button>
-                    <button onClick={() => toggleMute(idx)} className="ml-2 bg-black/50 p-3 rounded-full text-white pointer-events-auto">Sound</button>
-                  </div>
+              {/* ── Mindful Break Overlay ────────────────────────────── */}
+              {showMindfulOverlay && (
+                <div className="absolute inset-0 bg-black/85 backdrop-blur-sm flex flex-col items-center justify-center z-30 px-8 text-center">
+                  <div className="text-5xl mb-5">🧘</div>
+                  <h2 className="text-white text-2xl font-bold mb-3">
+                    Mindful Moment
+                  </h2>
+                  <p className="text-gray-300 text-sm leading-relaxed mb-2 max-w-xs">
+                    You've watched <span className="text-white font-semibold">5 reels</span> in a row.
+                  </p>
+                  <p className="text-gray-400 text-sm leading-relaxed mb-8 max-w-xs">
+                    Take a breath — are you scrolling with intention, or just on autopilot?
+                  </p>
+                  <button
+                    data-action
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      dismissMindful(idx);
+                    }}
+                    className="px-7 py-3 bg-white text-black font-semibold rounded-full text-sm hover:bg-gray-100 active:scale-95 transition-all"
+                  >
+                    Continue Watching
+                  </button>
                 </div>
+              )}
 
+              {/* ── Mute toggle (top-right) ──────────────────────────── */}
+              <div
+                data-action
+                className="absolute top-4 right-4 z-20"
+              >
+                <button
+                  data-action
+                  aria-label={isMuted ? "Unmute" : "Mute"}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    toggleMute(idx);
+                  }}
+                  className="w-10 h-10 rounded-full bg-black/40 backdrop-blur-sm flex items-center justify-center text-white hover:bg-black/60 transition-colors"
+                >
+                  {isMuted ? (
+                    <VolumeX className="w-5 h-5" />
+                  ) : (
+                    <Volume2 className="w-5 h-5" />
+                  )}
+                </button>
               </div>
+
+              {/* ── Right action bar ─────────────────────────────────── */}
+              <div
+                data-action
+                className="absolute right-3 bottom-28 flex flex-col items-center gap-5 z-20"
+              >
+                {/* Like */}
+                <button
+                  data-action
+                  aria-label="Like"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    toggleLike(reel);
+                  }}
+                  className="flex flex-col items-center gap-1 active:scale-90 transition-transform"
+                >
+                  <Heart
+                    className={`w-7 h-7 transition-colors ${
+                      likeState.liked
+                        ? "fill-red-500 stroke-red-500"
+                        : "stroke-white"
+                    }`}
+                  />
+                  <span className="text-white text-xs font-medium drop-shadow">
+                    {likeState.count}
+                  </span>
+                </button>
+
+                {/* Comment */}
+                <button
+                  data-action
+                  aria-label="Comment"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    handleComment(reel, idx);
+                  }}
+                  className="flex flex-col items-center gap-1 active:scale-90 transition-transform"
+                >
+                  <MessageCircle className="w-7 h-7 stroke-white" />
+                  <span className="text-white text-xs font-medium drop-shadow">
+                    {reel.comments}
+                  </span>
+                </button>
+
+                {/* Share */}
+                <button
+                  data-action
+                  aria-label="Share"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    handleShare(reel, idx);
+                  }}
+                  className="flex flex-col items-center gap-1 active:scale-90 transition-transform"
+                >
+                  <Share2 className="w-7 h-7 stroke-white" />
+                  <span className="text-white text-xs font-medium drop-shadow">
+                    Share
+                  </span>
+                </button>
+
+                {/* More */}
+                <button
+                  data-action
+                  aria-label="More options"
+                  className="flex flex-col items-center gap-1 active:scale-90 transition-transform"
+                >
+                  <MoreHorizontal className="w-7 h-7 stroke-white" />
+                </button>
+              </div>
+
+              {/* ── Bottom info overlay ──────────────────────────────── */}
+              <div className="absolute bottom-0 left-0 right-0 z-10 pointer-events-none px-4 pt-16 pb-5 bg-gradient-to-t from-black/80 via-black/40 to-transparent">
+                <div className="flex items-end gap-3">
+                  <div className="flex-1 min-w-0">
+                    {/* Username row */}
+                    <div className="flex items-center gap-2 mb-1.5 pointer-events-auto" data-action>
+                      <img
+                        src={reel.avatar}
+                        alt={reel.username}
+                        className="w-8 h-8 rounded-full object-cover ring-2 ring-white/40 flex-shrink-0"
+                      />
+                      <span className="text-white font-semibold text-sm truncate drop-shadow">
+                        {reel.username}
+                      </span>
+                      {reel.isVerified && (
+                        <BadgeCheck className="w-4 h-4 text-blue-400 flex-shrink-0" />
+                      )}
+                      <button
+                        data-action
+                        onClick={(e) => e.stopPropagation()}
+                        className="ml-1 text-xs px-3 py-0.5 rounded-full border border-white/80 text-white hover:bg-white/10 transition-colors flex-shrink-0"
+                      >
+                        Follow
+                      </button>
+                    </div>
+                    {/* Description */}
+                    <p className="text-white/90 text-sm leading-relaxed drop-shadow line-clamp-2">
+                      {reel.description}
+                    </p>
+                  </div>
+                </div>
+              </div>
+              </div>{/* end 9:16 box */}
             </div>
           );
         })}
+        {/* Infinite-scroll: loading next page spinner */}
+        {loadingAPI && reels.length > 0 && (
+          <div
+            className="reel-slide w-full flex-shrink-0 bg-black flex items-center justify-center"
+            style={{ scrollSnapAlign: "start", scrollSnapStop: "always" }}
+          >
+            <Loader2 className="w-8 h-8 text-white animate-spin opacity-60" />
+          </div>
+        )}
       </div>
     </div>
   );

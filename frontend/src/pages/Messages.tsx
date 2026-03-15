@@ -358,7 +358,7 @@ const Messages = () => {
     <div className={`flex h-screen bg-background ${monochrome ? "grayscale" : ""}`}>
       {/* Conversations List */}
       {!(isMobile && currentChat !== null) && (
-        <div className="w-full md:w-80 bg-card border-r border-border flex flex-col">
+        <div className="w-full md:w-80 bg-card border-r border-border flex flex-col mb-14 md:mb-0">
           {/* Header */}
           <div className="p-4 border-b border-border sticky top-0 bg-card z-10">
             <div className="flex items-center justify-between">
@@ -523,7 +523,7 @@ const Messages = () => {
       )}
 
       {/* Chat Area */}
-      <div className={`flex-1 flex flex-col ${isMobile && currentChat === null ? 'hidden' : ''}`}>
+      <div className={`flex-1 flex flex-col mb-14 md:mb-0 ${isMobile && currentChat === null ? 'hidden' : ''}`}>
         {currentChat ? (
           <>
             {/* Chat Header */}

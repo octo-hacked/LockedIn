@@ -156,7 +156,7 @@ export const getFeed = asyncHandler(async (req, res) => {
   
 
   // Build filter object
-  const filter = {};
+  const filter = { contentType: "image" };
   if (category && category !== "all") {
     filter.category = category;
   }
